@@ -3,15 +3,25 @@
 param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
-    [string]$Path
+    [string]$Path,
+
+    [switch]$TensorList,
+    [switch]$Hash,
+
+    [ValidateSet('Object', 'Json')]
+    [string]$Format = 'Object'
 )
+
+if ($PSVersionTable.PSVersion.Major -ge 6 -and $PSVersionTable.PSVersion -lt [version]'7.5') {
+    throw 'Use Windows PowerShell 5.1 or PowerShell 7.5 or later.'
+}
 
 function ConvertFrom-JsonText {
     param([string]$Text)
 
     $options = @{ InputObject = $Text; ErrorAction = 'Stop' }
     # PowerShell 7.5+ can preserve date strings instead of converting them.
-    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) {
+    if ($PSVersionTable.PSVersion.Major -ge 7) {
         $options.DateKind = 'String'
     }
     ConvertFrom-Json @options
@@ -52,28 +62,42 @@ function Get-JsonMetadata {
 }
 
 function Get-TrainingTags {
-    param($Groups)
+    param([string]$Json)
+
+    if (-not $Json.TrimStart().StartsWith('{')) {
+        throw 'Expected a JSON object containing tag groups.'
+    }
+    if ($PSVersionTable.PSVersion.Major -eq 5) {
+        # PowerShell 5.1 has no -AsHashtable option.
+        Add-Type -AssemblyName System.Web.Extensions
+        $parser = [System.Web.Script.Serialization.JavaScriptSerializer]::new()
+        $parser.MaxJsonLength = 100000000
+        $groups = $parser.DeserializeObject($Json)
+    }
+    else {
+        $groups = ConvertFrom-Json -InputObject $Json -AsHashtable -ErrorAction Stop
+    }
 
     # Keep tags with different capitalization separate.
     $totals = [System.Collections.Generic.Dictionary[string, long]]::new([System.StringComparer]::Ordinal)
-    foreach ($group in $Groups.PSObject.Properties) {
-        if ($group.Value -isnot [System.Management.Automation.PSCustomObject]) {
-            throw "Tag group '$($group.Name)' must be an object."
+    foreach ($group in $groups.GetEnumerator()) {
+        if ($group.Value -isnot [System.Collections.IDictionary]) {
+            throw "Tag group '$($group.Key)' must be an object."
         }
-        foreach ($tag in $group.Value.PSObject.Properties) {
+        foreach ($tag in $group.Value.GetEnumerator()) {
             $count = [long]0
             if (-not [long]::TryParse([string]$tag.Value, [ref]$count) -or $count -lt 0) {
-                throw "Tag '$($tag.Name)' must have a nonnegative integer count."
+                throw "Tag '$($tag.Key)' must have a nonnegative integer count."
             }
-            if ([string]::IsNullOrWhiteSpace($tag.Name)) { continue }
-            if ($totals.ContainsKey($tag.Name)) {
-                if ($count -gt ([long]::MaxValue - $totals[$tag.Name])) {
-                    throw "Total count for tag '$($tag.Name)' is too large."
+            if ([string]::IsNullOrWhiteSpace($tag.Key)) { continue }
+            if ($totals.ContainsKey($tag.Key)) {
+                if ($count -gt ([long]::MaxValue - $totals[$tag.Key])) {
+                    throw "Total count for tag '$($tag.Key)' is too large."
                 }
-                $totals[$tag.Name] += $count
+                $totals[$tag.Key] += $count
             }
             else {
-                $totals.Add($tag.Name, $count)
+                $totals.Add($tag.Key, $count)
             }
         }
     }
@@ -84,6 +108,7 @@ function Get-TrainingTags {
 }
 
 $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+if ($null -eq $file) { throw "File not found: $Path" }
 $stream = [System.IO.File]::OpenRead($file.FullName)
 $reader = [System.IO.BinaryReader]::new($stream)
 
@@ -151,12 +176,12 @@ if ($null -ne $softwareName -and $softwareName.TrimStart().StartsWith('{')) {
     $software = Get-JsonMetadata -Name 'software'
     $softwareName = Get-MetadataValue -Names 'name' -Source $software
 }
-$tagGroups = Get-JsonMetadata -Name 'ss_tag_frequency'
+$tagJson = Get-MetadataValue -Names 'ss_tag_frequency'
 
 $tags = @()
-if ($null -ne $tagGroups) {
+if ($null -ne $tagJson) {
     try {
-        $tags = @(Get-TrainingTags -Groups $tagGroups)
+        $tags = @(Get-TrainingTags -Json $tagJson)
     }
     catch {
         $warnings.Add("Could not read ss_tag_frequency: $($_.Exception.Message)")
@@ -172,8 +197,42 @@ if ($null -eq $baseModel) { $baseModel = Get-MetadataValue -Names 'base_model_na
 $resolution = Get-MetadataValue -Names 'modelspec.resolution', 'ss_resolution'
 if ($null -eq $resolution) { $resolution = Get-MetadataValue -Names 'resolution' -Source $trainingConfig }
 
-[pscustomobject]@{
+$tensorEntries = @($header.PSObject.Properties | Where-Object { $_.Name -cne '__metadata__' })
+foreach ($entry in $tensorEntries) {
+    $tensor = $entry.Value
+    if ($tensor -isnot [System.Management.Automation.PSCustomObject] -or
+        $tensor.dtype -isnot [string] -or [string]::IsNullOrWhiteSpace($tensor.dtype) -or
+        $tensor.shape -isnot [array]) {
+        throw "Invalid tensor '$($entry.Name)': expected a data type and a shape array."
+    }
+    foreach ($dimension in $tensor.shape) {
+        if (($dimension -isnot [int] -and $dimension -isnot [long]) -or $dimension -lt 0) {
+            throw "Invalid tensor '$($entry.Name)': shape dimensions must be nonnegative integers."
+        }
+    }
+}
+$tensors = @()
+if ($TensorList) {
+    $tensors = @(foreach ($entry in $tensorEntries) {
+        [pscustomobject]@{
+            Name  = $entry.Name
+            DType = $entry.Value.dtype
+            Shape = @($entry.Value.shape)
+        }
+    })
+}
+
+$sha256 = $null
+if ($Hash) {
+    $sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+}
+
+$result = [pscustomobject]@{
     FilePath         = $file.FullName
+    SizeBytes        = $file.Length
+    SHA256           = $sha256
+    TensorCount      = $tensorEntries.Count
+    Tensors          = $tensors
     HasMetadata      = @($metadata.PSObject.Properties).Count -gt 0
     Title            = Get-MetadataValue -Names 'modelspec.title', 'ss_output_name', 'name'
     Description      = Get-MetadataValue -Names 'modelspec.description', 'description'
@@ -190,4 +249,12 @@ if ($null -eq $resolution) { $resolution = Get-MetadataValue -Names 'resolution'
     TrainingTags     = $tags
     Warnings         = $warnings.ToArray()
     Metadata         = $metadata
+}
+
+if ($Format -eq 'Json') {
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $result | ConvertTo-Json -Depth 10
+}
+else {
+    $result
 }

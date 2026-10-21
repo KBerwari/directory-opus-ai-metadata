@@ -64,6 +64,56 @@ try {
     Assert-Equal $result.Metadata.ss_steps '1200'
     Assert-Equal ($result.Metadata.ss_steps -is [string]) $true
 
+    # File size, tensor details, and optional hashing
+    Assert-Equal $result.SizeBytes (8 + $utf8.GetByteCount($json) + 4)
+    Assert-Equal $result.TensorCount 1
+    Assert-Equal $result.Tensors.Count 0
+    Assert-Equal $result.SHA256 $null
+    $result = & $scriptPath -Path $path -TensorList
+    Assert-Equal $result.Tensors.Count 1
+    Assert-Equal $result.Tensors[0].Name 'weight'
+    Assert-Equal $result.Tensors[0].DType 'F32'
+    Assert-Equal ($result.Tensors[0].Shape -is [array]) $true
+    Assert-Equal $result.Tensors[0].Shape.Count 1
+    Assert-Equal $result.Tensors[0].Shape[0] 1
+
+    # Independent digest of the exact fixture bytes.
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $hasher.ComputeHash([System.IO.File]::ReadAllBytes($path))
+        $expectedHash = ([System.BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+    }
+    $result = & $scriptPath -Path $path -Hash
+    Assert-Equal $result.SHA256 $expectedHash
+
+    $jsonResult = & $scriptPath -Path $path -TensorList -Hash -Format Json
+    Assert-Equal ($jsonResult -is [string]) $true
+    $decoded = $jsonResult | ConvertFrom-Json
+    Assert-Equal $decoded.FilePath $path
+    Assert-Equal $decoded.SizeBytes $result.SizeBytes
+    Assert-Equal $decoded.SHA256 $expectedHash
+    Assert-Equal $decoded.Metadata.ss_steps '1200'
+    Assert-Equal ($decoded.Tensors -is [array]) $true
+    Assert-Equal $decoded.Tensors.Count 1
+    Assert-Equal $decoded.Tensors[0].Name 'weight'
+    Assert-Equal ($decoded.Tensors[0].Shape -is [array]) $true
+    Assert-Equal $decoded.Tensors[0].Shape[0] 1
+    Assert-Equal ($decoded.TrainingTags -is [array]) $true
+    Assert-Equal ($decoded.Warnings -is [array]) $true
+
+    $json = '{"scalar":{"dtype":"F32","shape":[],"data_offsets":[0,4]},"matrix":{"dtype":"F16","shape":[2,3],"data_offsets":[4,16]}}'
+    $path = New-TestFile -Header $utf8.GetBytes($json) -Payload ([byte[]]::new(16))
+    $result = & $scriptPath -Path $path -TensorList
+    Assert-Equal $result.TensorCount 2
+    $scalar = $result.Tensors | Where-Object { $_.Name -eq 'scalar' }
+    $matrix = $result.Tensors | Where-Object { $_.Name -eq 'matrix' }
+    Assert-Equal $scalar.Shape.Count 0
+    Assert-Equal $matrix.DType 'F16'
+    Assert-Equal ($matrix.Shape -join ',') '2,3'
+
     foreach ($header in @('{}', '{"__metadata__":{}}      ')) {
         $path = New-TestFile -Header $utf8.GetBytes($header)
         $result = & $scriptPath -Path $path
@@ -72,6 +122,11 @@ try {
         Assert-Equal $result.TrainingSteps $null
         Assert-Equal $result.TrainingTags.Count 0
         Assert-Equal $result.Warnings.Count 0
+        Assert-Equal $result.TensorCount 0
+        $decoded = & $scriptPath -Path $path -TensorList -Format Json | ConvertFrom-Json
+        Assert-Equal ($decoded.Tensors -is [array]) $true
+        Assert-Equal $decoded.Tensors.Count 0
+        Assert-Equal $decoded.SHA256 $null
     }
 
     # Dates should stay as strings.
@@ -85,6 +140,9 @@ try {
     $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":{"description":"' + $text + '"}}') -Name "model [$text].safetensors"
     $result = & $scriptPath -Path $path
     Assert-Equal $result.Metadata.description $text
+    $decoded = & $scriptPath -Path $path -Format Json | ConvertFrom-Json
+    Assert-Equal $decoded.FilePath $path
+    Assert-Equal $decoded.Metadata.description $text
 
     # Incomplete or invalid headers
     $path = Join-Path $testDirectory 'short.safetensors'
