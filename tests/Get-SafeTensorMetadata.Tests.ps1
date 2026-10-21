@@ -2,8 +2,9 @@
 
 $ErrorActionPreference = 'Stop'
 $scriptPath = Join-Path $PSScriptRoot '..\src\Get-SafeTensorMetadata.ps1'
-$testDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('opus-metadata-tests-' + [guid]::NewGuid())
+$testDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('opus-tests-' + [guid]::NewGuid())
 [void][System.IO.Directory]::CreateDirectory($testDirectory)
+$utf8 = [System.Text.Encoding]::UTF8
 
 function New-TestFile {
     param(
@@ -15,8 +16,7 @@ function New-TestFile {
 
     if ($null -eq $HeaderLength) { $HeaderLength = $Header.Length }
     $path = Join-Path $testDirectory $Name
-    $stream = [System.IO.File]::Create($path)
-    $writer = [System.IO.BinaryWriter]::new($stream)
+    $writer = [System.IO.BinaryWriter]::new([System.IO.File]::Create($path))
     try {
         $writer.Write([uint64]$HeaderLength)
         $writer.Write($Header)
@@ -26,6 +26,14 @@ function New-TestFile {
         $writer.Dispose()
     }
     return $path
+}
+
+function Read-TestMetadata {
+    param([hashtable]$Metadata)
+
+    $json = @{ __metadata__ = $Metadata } | ConvertTo-Json -Depth 10 -Compress
+    $path = New-TestFile -Header $utf8.GetBytes($json)
+    & $scriptPath -Path $path
 }
 
 function Assert-Equal {
@@ -47,103 +55,198 @@ function Assert-Rejected {
     throw "Expected the reader to reject '$Path'."
 }
 
-$utf8 = [System.Text.Encoding]::UTF8
-$tests = [ordered]@{
-    'Reads metadata and preserves JSON strings' = {
-        $json = '{"__metadata__":{"ss_steps":"1200","ss_tag_frequency":"{\"portrait\":4}"},"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
-        $path = New-TestFile -Header $utf8.GetBytes($json) -Payload ([byte[]]@(0, 0, 0, 0))
-        $result = & $scriptPath -Path $path
-        Assert-Equal $result.FilePath $path
-        Assert-Equal $result.Metadata.ss_steps '1200'
-        Assert-Equal $result.Metadata.ss_tag_frequency '{"portrait":4}'
-        Assert-Equal ($result.Metadata.ss_steps -is [string]) $true
-    }
-    'Returns empty metadata when it is absent' = {
-        $path = New-TestFile -Header $utf8.GetBytes('{}')
-        $result = & $scriptPath -Path $path
-        Assert-Equal @($result.Metadata.PSObject.Properties).Count 0
-    }
-    'Accepts padding and empty metadata' = {
-        $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":{}}      ')
-        $result = & $scriptPath -Path $path
-        Assert-Equal @($result.Metadata.PSObject.Properties).Count 0
-    }
-    'Preserves Unicode and treats brackets in paths literally' = {
-        $text = 'caf' + [char]0xE9
-        $json = '{"__metadata__":{"description":"' + $text + '"}}'
-        $path = New-TestFile -Header $utf8.GetBytes($json) -Name ('model [' + $text + '].safetensors')
-        $result = & $scriptPath -Path $path
-        Assert-Equal $result.Metadata.description $text
-    }
-    'Rejects files shorter than eight bytes' = {
-        $path = Join-Path $testDirectory 'short.safetensors'
-        [System.IO.File]::WriteAllBytes($path, [byte[]]@(0, 0, 0))
-        Assert-Rejected $path 'too short'
-    }
-    'Rejects a truncated header' = {
-        $path = New-TestFile -Header $utf8.GetBytes('{}') -HeaderLength 20
-        Assert-Rejected $path 'before the declared'
-    }
-    'Rejects invalid header lengths before allocating memory' = {
-        foreach ($length in @([uint64]0, [uint64]1, [uint64]100000001, [uint64]::MaxValue)) {
-            $path = New-TestFile -Header ([byte[]]@()) -HeaderLength $length
-            Assert-Rejected $path 'Invalid SafeTensors header length'
-        }
-    }
-    'Rejects headers that do not start with an object' = {
-        $path = New-TestFile -Header $utf8.GetBytes('[]')
-        Assert-Rejected $path 'must begin with a JSON object'
-    }
-    'Rejects malformed JSON' = {
-        $path = New-TestFile -Header $utf8.GetBytes('{broken}')
-        Assert-Rejected $path 'invalid JSON'
-    }
-    'Rejects invalid UTF-8' = {
-        $path = New-TestFile -Header ([byte[]]@(0x7B, 0x22, 0xFF, 0x22, 0x3A, 0x22, 0x22, 0x7D))
-        Assert-Rejected $path 'invalid UTF-8'
-    }
-    'Rejects metadata that is not an object' = {
-        foreach ($value in @('null', '[]', '"text"')) {
-            $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":' + $value + '}')
-            Assert-Rejected $path 'metadata must be a JSON object'
-        }
-    }
-    'Rejects non-string metadata values' = {
-        foreach ($value in @('42', 'null', '{}', '[]', 'true')) {
-            $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":{"steps":' + $value + '}}')
-            Assert-Rejected $path "metadata value 'steps' must be a string"
-        }
-    }
-    'Reports a missing file' = {
-        Assert-Rejected (Join-Path $testDirectory 'missing.safetensors') 'does not exist'
-    }
-    'Closes the file after success and failure' = {
-        foreach ($json in @('{}', '{broken}')) {
-            $path = New-TestFile -Header $utf8.GetBytes($json)
-            try { & $scriptPath -Path $path | Out-Null } catch { }
-            $stream = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
-            $stream.Dispose()
-        }
-    }
-}
-
-$failed = 0
 try {
-    foreach ($test in $tests.GetEnumerator()) {
-        try {
-            & $test.Value
-            Write-Host "PASS $($test.Key)"
+    # File reading
+    $json = '{"__metadata__":{"ss_steps":"1200"},"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}'
+    $path = New-TestFile -Header $utf8.GetBytes($json) -Payload ([byte[]]@(0, 0, 0, 0))
+    $result = & $scriptPath -Path $path
+    Assert-Equal $result.FilePath $path
+    Assert-Equal $result.Metadata.ss_steps '1200'
+    Assert-Equal ($result.Metadata.ss_steps -is [string]) $true
+
+    foreach ($header in @('{}', '{"__metadata__":{}}      ')) {
+        $path = New-TestFile -Header $utf8.GetBytes($header)
+        $result = & $scriptPath -Path $path
+        Assert-Equal $result.HasMetadata $false
+        Assert-Equal @($result.Metadata.PSObject.Properties).Count 0
+        Assert-Equal $result.TrainingSteps $null
+        Assert-Equal $result.TrainingTags.Count 0
+        Assert-Equal $result.Warnings.Count 0
+    }
+
+    # Dates should stay as strings.
+    foreach ($date in @('2026-05-25T00:08:41', '2026-05-25T00:08:41Z', '2026-05-25T00:08:41.123+02:00')) {
+        $result = Read-TestMetadata @{ 'modelspec.date' = $date }
+        Assert-Equal ($result.Metadata.'modelspec.date' -is [string]) $true
+        Assert-Equal $result.Metadata.'modelspec.date' $date
+    }
+
+    $text = 'caf' + [char]0xE9
+    $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":{"description":"' + $text + '"}}') -Name "model [$text].safetensors"
+    $result = & $scriptPath -Path $path
+    Assert-Equal $result.Metadata.description $text
+
+    # Incomplete or invalid headers
+    $path = Join-Path $testDirectory 'short.safetensors'
+    [System.IO.File]::WriteAllBytes($path, [byte[]]@(0, 0, 0))
+    Assert-Rejected $path 'too short'
+
+    $path = New-TestFile -Header $utf8.GetBytes('{}') -HeaderLength 20
+    Assert-Rejected $path 'before the declared'
+
+    foreach ($length in @([uint64]0, [uint64]1, [uint64]100000001, [uint64]::MaxValue)) {
+        $path = New-TestFile -Header ([byte[]]@()) -HeaderLength $length
+        Assert-Rejected $path 'Invalid SafeTensors header length'
+    }
+    $path = New-TestFile -Header $utf8.GetBytes('[]')
+    Assert-Rejected $path 'must begin with a JSON object'
+    $path = New-TestFile -Header $utf8.GetBytes('{broken}')
+    Assert-Rejected $path 'invalid JSON'
+    $path = New-TestFile -Header ([byte[]]@(0x7B, 0x22, 0xFF, 0x22, 0x3A, 0x22, 0x22, 0x7D))
+    Assert-Rejected $path 'invalid UTF-8'
+    foreach ($value in @('null', '[]', '"text"')) {
+        $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":' + $value + '}')
+        Assert-Rejected $path 'metadata must be a JSON object'
+    }
+    foreach ($value in @('42', 'null', '{}', '[]', 'true')) {
+        $path = New-TestFile -Header $utf8.GetBytes('{"__metadata__":{"steps":' + $value + '}}')
+        Assert-Rejected $path "metadata value 'steps' must be a string"
+    }
+    Assert-Rejected (Join-Path $testDirectory 'missing.safetensors') 'does not exist'
+
+    foreach ($header in @('{}', '{broken}')) {
+        $path = New-TestFile -Header $utf8.GetBytes($header)
+        if ($header -eq '{}') { & $scriptPath -Path $path | Out-Null }
+        else { Assert-Rejected $path 'invalid JSON' }
+        $file = [System.IO.File]::Open($path, 'Open', 'ReadWrite', 'None')
+        $file.Dispose()
+    }
+
+    # ModelSpec and Kohya fields
+    $result = Read-TestMetadata @{
+        'modelspec.title' = 'Example LoRA'
+        'modelspec.description' = 'An example model'
+        'modelspec.architecture' = 'example/lora'
+        'modelspec.resolution' = '1280x720'
+        ss_output_name = 'training-name'
+        ss_resolution = '(1024, 1024)'
+        ss_sd_model_name = 'base.safetensors'
+        ss_base_model_version = 'example_9b'
+        ss_steps = '1920'
+        ss_epoch = '4'
+    }
+    Assert-Equal $result.HasMetadata $true
+    Assert-Equal $result.Title 'Example LoRA'
+    Assert-Equal $result.Description 'An example model'
+    Assert-Equal $result.Architecture 'example/lora'
+    Assert-Equal $result.Resolution '1280x720'
+    Assert-Equal $result.BaseModel 'base.safetensors'
+    Assert-Equal $result.BaseModelVersion 'example_9b'
+    Assert-Equal $result.TrainingSteps '1920'
+    Assert-Equal $result.TrainingEpoch '4'
+
+    $result = Read-TestMetadata @{ 'modelspec.title' = ' '; ss_output_name = 'training-name'; ss_resolution = '(1024, 1024)' }
+    Assert-Equal $result.Title 'training-name'
+    Assert-Equal $result.Resolution '(1024, 1024)'
+
+    $result = Read-TestMetadata @{ ss_max_train_steps = '2000'; ss_num_epochs = '10' }
+    Assert-Equal $result.TrainingSteps $null
+    Assert-Equal $result.TrainingEpoch $null
+
+    $result = Read-TestMetadata @{ ss_steps = '0'; ss_epoch = '0' }
+    Assert-Equal $result.TrainingSteps '0'
+    Assert-Equal $result.TrainingEpoch '0'
+
+    # Tag counts and sorting
+    $tagJson = '{"a":{"portrait":3,"zebra":2,"apple":2},"b":{"portrait":2},"c":{"Portrait":1}}'
+    $result = Read-TestMetadata @{ ss_tag_frequency = $tagJson }
+    Assert-Equal $result.Metadata.ss_tag_frequency $tagJson
+    Assert-Equal $result.TrainingTags.Count 4
+    Assert-Equal $result.TrainingTags[0].Tag 'portrait'
+    Assert-Equal $result.TrainingTags[0].Count 5
+    Assert-Equal $result.TrainingTags[1].Tag 'apple'
+    Assert-Equal $result.TrainingTags[2].Tag 'zebra'
+    Assert-Equal $result.TrainingTags[3].Tag 'Portrait'
+    Assert-Equal $result.TriggerPhrase $null
+    Assert-Equal $result.Warnings.Count 0
+    foreach ($tagJson in @('{}', '{"set":{}}')) {
+        $result = Read-TestMetadata @{ ss_tag_frequency = $tagJson }
+        Assert-Equal ($result.TrainingTags -is [array]) $true
+        Assert-Equal $result.TrainingTags.Count 0
+    }
+    $result = Read-TestMetadata @{ ss_tag_frequency = '{"set":{"portrait":0}}' }
+    Assert-Equal ($result.TrainingTags -is [array]) $true
+    Assert-Equal $result.TrainingTags.Count 1
+    Assert-Equal $result.TrainingTags[0].Count 0
+    $invalidTags = @('{broken}', 'null', '[]', '{"set":null}', '{"set":{"portrait":-1}}', '{"set":{"portrait":1.5}}', '{"a":{"portrait":9223372036854775807},"b":{"portrait":1}}')
+    foreach ($tagJson in $invalidTags) {
+        $result = Read-TestMetadata @{ ss_output_name = 'Example'; ss_tag_frequency = $tagJson }
+        Assert-Equal $result.Title 'Example'
+        Assert-Equal $result.TrainingTags.Count 0
+        Assert-Equal $result.Warnings.Count 1
+    }
+
+    # AI Toolkit
+    foreach ($step in @(0, 1200)) {
+        $trainingInfo = @{ step = $step; epoch = 3 } | ConvertTo-Json -Compress
+        $result = Read-TestMetadata @{
+            ss_output_name = 'Toolkit LoRA'
+            training_info = $trainingInfo
+            software = '{"name":"ai-toolkit","version":"example"}'
         }
-        catch {
-            $failed++
-            Write-Host "FAIL $($test.Key): $($_.Exception.Message)"
-        }
+        Assert-Equal $result.Title 'Toolkit LoRA'
+        Assert-Equal $result.TrainingSteps $step
+        Assert-Equal $result.TrainingEpoch 3
+        Assert-Equal $result.Software 'ai-toolkit'
+        Assert-Equal $result.Metadata.training_info $trainingInfo
+    }
+    foreach ($value in @('{broken}', '[]', '[{}]', 'null')) {
+        $result = Read-TestMetadata @{ ss_steps = '50'; training_info = $value }
+        Assert-Equal $result.TrainingSteps '50'
+        Assert-Equal $result.Metadata.training_info $value
+        Assert-Equal $result.Warnings.Count 1
+    }
+
+    # OneTrainer: configured epochs are not completed epochs.
+    $config = '{"base_model_name":"example/base","resolution":"1024","epochs":20}'
+    $result = Read-TestMetadata @{ 'modelspec.title' = 'OneTrainer LoRA'; ot_config = $config }
+    Assert-Equal $result.Title 'OneTrainer LoRA'
+    Assert-Equal $result.BaseModel 'example/base'
+    Assert-Equal $result.Resolution '1024'
+    Assert-Equal $result.TrainingEpoch $null
+    $result = Read-TestMetadata @{ ss_steps = '50'; ss_epoch = '1'; training_info = '{"step":100,"epoch":2}' }
+    Assert-Equal $result.TrainingSteps '50'
+    Assert-Equal $result.TrainingEpoch '1'
+
+    # Fizgig trigger phrase and tags
+    $result = Read-TestMetadata @{
+        'modelspec.trigger_phrase' = 'example subject'
+        'modelspec.usage_hint' = "Include 'example subject' in your prompt."
+        'modelspec.tags' = 'portrait, style'
+    }
+    Assert-Equal $result.TriggerPhrase 'example subject'
+    Assert-Equal $result.UsageHint "Include 'example subject' in your prompt."
+    Assert-Equal $result.ModelTags 'portrait, style'
+    Assert-Equal $result.TrainingTags.Count 0
+
+    # Raw metadata should stay unchanged.
+    $metadata = @{
+        name = 'Custom LoRA'
+        description = "Training notes about this model.`n" * 150
+        custom_settings = '{"anything":[1,2,3]}'
+        software = 'custom trainer'
+        '_' = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_,. -' * 80
+        'modelspec.thumbnail' = 'data:image/png;base64,iVBORw0KGgo='
+    }
+    $result = Read-TestMetadata $metadata
+    Assert-Equal $result.Title 'Custom LoRA'
+    Assert-Equal $result.Software 'custom trainer'
+    foreach ($name in $metadata.Keys) {
+        Assert-Equal $result.Metadata.PSObject.Properties[$name].Value $metadata[$name]
     }
 }
 finally {
-    # Delete only the unique temporary directory created by this run.
     [System.IO.Directory]::Delete($testDirectory, $true)
 }
 
-if ($failed -gt 0) { throw "$failed test(s) failed." }
-Write-Host "$($tests.Count) tests passed."
+Write-Host 'SafeTensors metadata checks passed.'
